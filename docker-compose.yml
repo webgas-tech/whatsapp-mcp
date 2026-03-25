@@ -1,0 +1,51 @@
+services:
+  whatsapp-bridge:
+    build:
+      context: ./whatsapp-bridge
+      dockerfile: Dockerfile
+    container_name: whatsapp-bridge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./whatsapp-bridge/store:/app/store
+    environment:
+      - WHATSAPP_BRIDGE_PORT=8080
+      - WHATSAPP_API_KEY=${WHATSAPP_API_KEY:-}
+      - WHATSAPP_RATE_LIMIT=${WHATSAPP_RATE_LIMIT:-5}
+      - WHATSAPP_BIND_ALL=true  # Inside container, expose on all interfaces (host binding restricts access)
+      - FORWARD_SELF=${FORWARD_SELF:-false}
+      - WEBHOOK_URL=${WEBHOOK_URL:-}
+    networks:
+      - whatsapp-internal
+    # First run requires interactive QR scan:
+    #   docker compose run --rm -it whatsapp-bridge
+    # After first auth, session persists in store/ volume
+
+  # The MCP server runs via stdio (not as a long-running container).
+  # Use this for building/testing the image only.
+  # In production, run directly: uv run main.py
+  whatsapp-mcp-server:
+    build:
+      context: ./whatsapp-mcp-server
+      dockerfile: Dockerfile
+    container_name: whatsapp-mcp-server
+    volumes:
+      - ./whatsapp-bridge/store:/app/store:ro
+    environment:
+      - WHATSAPP_DB_PATH=/app/store/messages.db
+      - WHATSAPP_API_URL=http://whatsapp-bridge:8080/api
+      - WHATSAPP_API_KEY=${WHATSAPP_API_KEY:-}
+      - WHATSAPP_READ_ONLY=${WHATSAPP_READ_ONLY:-true}
+      - WHATSAPP_MEDIA_DIR=${WHATSAPP_MEDIA_DIR:-}
+    networks:
+      - whatsapp-internal
+    depends_on:
+      - whatsapp-bridge
+    profiles:
+      - tools  # Only start when explicitly requested
+
+networks:
+  whatsapp-internal:
+    driver: bridge
+    internal: true  # No external access — only inter-container communication

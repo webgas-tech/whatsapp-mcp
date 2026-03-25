@@ -6,9 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is the **whatsapp-mcp** repository - a Model Context Protocol (MCP) server for WhatsApp messaging. It enables Claude and other MCP clients to read, search, and send WhatsApp messages.
 
-Originally forked from [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp), now maintained by [Very Good Plugins](https://verygoodplugins.com/?utm_source=github).
+Originally forked from [verygoodplugins/whatsapp-mcp](https://github.com/verygoodplugins/whatsapp-mcp) (itself a fork of lharries/whatsapp-mcp). Hardened fork maintained by webgas-tech.
 
-**Important:** This is the `verygoodplugins/whatsapp-mcp` fork. Always use `origin` (not `upstream`) for PRs, issues, and `gh` commands. The default repo is set via `gh repo set-default verygoodplugins/whatsapp-mcp`.
+**Important:** This is the `webgas-tech/whatsapp-mcp` hardened fork. Always use `origin` for PRs, issues, and `gh` commands.
+
+## Security Hardening
+
+This fork adds: API key auth, localhost-only binding, rate limiting, read-only mode (default), prompt injection sanitization, file path sandboxing, and Docker support. See `AGENTS.md` for full details.
 
 ## Architecture
 

@@ -36,6 +36,62 @@ import (
 // Defaults to true. Override with env FORWARD_SELF=false.
 var forwardSelfMessages = getEnvBool("FORWARD_SELF", true)
 
+// API key for authenticating requests to the REST API.
+// Set via WHATSAPP_API_KEY env var. If empty, no auth is required (NOT recommended).
+var apiKey = os.Getenv("WHATSAPP_API_KEY")
+
+// Whether to bind to localhost only (default true for security).
+// Set WHATSAPP_BIND_ALL=true to listen on all interfaces.
+var bindAll = getEnvBool("WHATSAPP_BIND_ALL", false)
+
+// Rate limit for /api/send endpoint (messages per minute).
+// Default 5. Override with WHATSAPP_RATE_LIMIT env var.
+var rateLimitPerMinute int
+
+// Simple token bucket rate limiter for send endpoint
+type rateLimiter struct {
+	tokens    int
+	maxTokens int
+	lastReset time.Time
+	interval  time.Duration
+}
+
+func newRateLimiter(maxPerMinute int) *rateLimiter {
+	return &rateLimiter{
+		tokens:    maxPerMinute,
+		maxTokens: maxPerMinute,
+		lastReset: time.Now(),
+		interval:  time.Minute,
+	}
+}
+
+func (rl *rateLimiter) allow() bool {
+	now := time.Now()
+	if now.Sub(rl.lastReset) >= rl.interval {
+		rl.tokens = rl.maxTokens
+		rl.lastReset = now
+	}
+	if rl.tokens > 0 {
+		rl.tokens--
+		return true
+	}
+	return false
+}
+
+// authMiddleware checks the API key if one is configured
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if apiKey != "" {
+			auth := r.Header.Get("Authorization")
+			if auth != "Bearer "+apiKey {
+				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
 // getEnvBool reads a boolean env var with a default.
 // Accepts: 1/true/yes/on and 0/false/no/off (case-insensitive)
 func getEnvBool(key string, def bool) bool {
@@ -1085,8 +1141,11 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Initialize rate limiter for send endpoint
+	sendLimiter := newRateLimiter(rateLimitPerMinute)
+
 	// Health check endpoint
-	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/health", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		status := map[string]interface{}{
 			"status":    "ok",
@@ -1098,10 +1157,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		_ = json.NewEncoder(w).Encode(status)
-	})
+	}))
 
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/send", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1126,6 +1185,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		// Rate limit check
+		if !sendLimiter.allow() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Rate limit exceeded: max %d messages per minute", rateLimitPerMinute),
+			})
+			return
+		}
+
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
@@ -1144,10 +1214,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
-	})
+	}))
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/download", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1209,10 +1279,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
-	})
+	}))
 
 	// Handler for sending typing indicator
-	http.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/typing", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1285,11 +1355,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				"message": fmt.Sprintf("Typing indicator set to %v", req.IsTyping),
 			})
 		}
-	})
+	}))
 
-	// Start the server with proper timeouts
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Determine bind address
+	bindAddr := "127.0.0.1"
+	if bindAll {
+		bindAddr = "0.0.0.0"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindAddr, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	if apiKey != "" {
+		fmt.Println("🔒 API key authentication enabled")
+	} else {
+		fmt.Println("⚠️  WARNING: No WHATSAPP_API_KEY set — API is unauthenticated!")
+	}
 
 	// Create server with timeouts for stability
 	server := &http.Server{
@@ -1512,6 +1591,18 @@ connectionSuccess:
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	// Parse rate limit
+	rateLimitPerMinute = 5
+	if rl := os.Getenv("WHATSAPP_RATE_LIMIT"); rl != "" {
+		v, err := strconv.Atoi(rl)
+		if err != nil || v < 1 {
+			logger.Errorf("Invalid WHATSAPP_RATE_LIMIT=%q, must be a positive integer", rl)
+			return
+		}
+		rateLimitPerMinute = v
+	}
+	logger.Infof("Rate limit: %d messages/minute", rateLimitPerMinute)
 
 	// Start REST API server
 	port := 8080

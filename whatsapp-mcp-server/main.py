@@ -1,5 +1,8 @@
+import os
+import re
 import signal
 import sys
+import unicodedata
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -44,6 +47,70 @@ from whatsapp import (
     send_message as whatsapp_send_message,
 )
 
+# --- Security configuration ---
+
+# Read-only mode: when True (default), send tools are not registered at all.
+# Set WHATSAPP_READ_ONLY=false to enable send_message, send_file, send_audio_message.
+READ_ONLY = os.getenv("WHATSAPP_READ_ONLY", "true").lower() not in ("false", "0", "no", "off")
+
+# Allowed media directory for send_file / send_audio_message.
+# If set, only files under this directory can be sent (prevents arbitrary file exfiltration).
+MEDIA_DIR = os.getenv("WHATSAPP_MEDIA_DIR", "")
+
+# --- Prompt injection sanitization ---
+
+# Zero-width and invisible Unicode characters used in prompt injection attacks
+_INVISIBLE_CHARS = re.compile(
+    r"[\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u034f\u180e]"
+)
+
+# Common prompt injection patterns (case-insensitive)
+_INJECTION_PATTERNS = re.compile(
+    r"(?i)(?:"
+    r"(?:^|\n)\s*(?:SYSTEM|ASSISTANT|HUMAN)\s*:"
+    r"|IGNORE (?:ALL )?PREVIOUS (?:INSTRUCTIONS?|CONTEXT)"
+    r"|YOU ARE NOW"
+    r"|NEW INSTRUCTIONS?:"
+    r"|<\/?(?:system|prompt|instruction|tool_call)>"
+    r"|BEGIN (?:NEW )?SESSION"
+    r"|FORGET (?:ALL|EVERYTHING|PREVIOUS)"
+    r")"
+)
+
+
+def sanitize_content(text: str | None) -> str | None:
+    """Sanitize message content to mitigate prompt injection attacks."""
+    if text is None:
+        return None
+    # Strip invisible Unicode characters
+    text = _INVISIBLE_CHARS.sub("", text)
+    # Flag suspicious patterns (don't remove — let the LLM see the warning)
+    if _INJECTION_PATTERNS.search(text):
+        text = f"[⚠️ SUSPICIOUS CONTENT DETECTED] {text}"
+    return text
+
+
+def sanitize_message_dict(msg: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize a message dictionary's content field."""
+    if "content" in msg and msg["content"]:
+        msg["content"] = f"[EXTERNAL MESSAGE] {sanitize_content(msg['content'])}"
+    if "last_message" in msg and msg["last_message"]:
+        msg["last_message"] = f"[EXTERNAL MESSAGE] {sanitize_content(msg['last_message'])}"
+    return msg
+
+
+def validate_media_path(media_path: str) -> str | None:
+    """Validate that a media path is within the allowed MEDIA_DIR.
+    Returns an error message if invalid, None if valid."""
+    if not MEDIA_DIR:
+        return None  # No restriction configured
+    real_path = os.path.realpath(media_path)
+    real_media_dir = os.path.realpath(MEDIA_DIR)
+    if not real_path.startswith(real_media_dir + os.sep) and real_path != real_media_dir:
+        return f"Access denied: file must be within WHATSAPP_MEDIA_DIR ({MEDIA_DIR})"
+    return None
+
+
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
@@ -56,7 +123,7 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
         query: Search term to match against contact names or phone numbers
     """
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return [sanitize_message_dict(c) for c in contacts]
 
 
 @mcp.tool()
@@ -188,6 +255,9 @@ def list_messages(
     """
     # Cap limit at 500 to prevent excessive queries
     limit = min(limit, 500)
+    # Cap context params to prevent abuse
+    context_before = min(context_before, 10)
+    context_after = min(context_after, 10)
     messages = whatsapp_list_messages(
         after=after,
         before=before,
@@ -201,7 +271,7 @@ def list_messages(
         context_after=context_after,
         sort_by=sort_by,
     )
-    return messages
+    return [sanitize_message_dict(m) for m in messages]
 
 
 @mcp.tool()
@@ -226,7 +296,7 @@ def list_chats(
     chats = whatsapp_list_chats(
         query=query, limit=limit, page=page, include_last_message=include_last_message, sort_by=sort_by
     )
-    return chats
+    return [sanitize_message_dict(c) for c in chats]
 
 
 @mcp.tool()
@@ -238,7 +308,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    return sanitize_message_dict(chat) if chat else chat
 
 
 @mcp.tool()
@@ -249,7 +319,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any]:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    return sanitize_message_dict(chat) if chat else chat
 
 
 @mcp.tool()
@@ -262,7 +332,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
         page: Page number for pagination (default 0)
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    return [sanitize_message_dict(c) for c in chats]
 
 
 @mcp.tool()
@@ -276,7 +346,7 @@ def get_last_interaction(jid: str) -> dict[str, Any]:
         Message dictionary with id, timestamp, sender, content, etc. or empty dict if not found.
     """
     message = whatsapp_get_last_interaction(jid)
-    return message if message else {}
+    return sanitize_message_dict(message) if message else {}
 
 
 @mcp.tool()
@@ -288,63 +358,79 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dic
         before: Number of messages to include before the target message (default 5)
         after: Number of messages to include after the target message (default 5)
     """
+    # Cap context params
+    before = min(before, 20)
+    after = min(after, 20)
     context = whatsapp_get_message_context(message_id, before, after)
+    # Sanitize all messages in context
+    if isinstance(context, dict):
+        if "message" in context:
+            context["message"] = sanitize_message_dict(context["message"])
+        for key in ("before", "after"):
+            if key in context and isinstance(context[key], list):
+                context[key] = [sanitize_message_dict(m) for m in context[key]]
     return context
 
 
-@mcp.tool()
-def send_message(recipient: str, message: str) -> dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
+## --- Write tools (only registered when WHATSAPP_READ_ONLY=false) ---
 
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        message: The message text to send
+if not READ_ONLY:
 
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    # Validate input
-    if not recipient:
-        return {"success": False, "message": "Recipient must be provided"}
+    @mcp.tool()
+    def send_message(recipient: str, message: str) -> dict[str, Any]:
+        """Send a WhatsApp message to a person or group. For group chats use the JID.
 
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {"success": success, "message": status_message}
+        Args:
+            recipient: The recipient - either a phone number with country code but no + or other symbols,
+                     or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+            message: The message text to send
 
+        Returns:
+            A dictionary containing success status and a status message
+        """
+        if not recipient:
+            return {"success": False, "message": "Recipient must be provided"}
 
-@mcp.tool()
-def send_file(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
+        success, status_message = whatsapp_send_message(recipient, message)
+        return {"success": success, "message": status_message}
 
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
+    @mcp.tool()
+    def send_file(recipient: str, media_path: str) -> dict[str, Any]:
+        """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
 
-    Returns:
-        A dictionary containing success status and a status message
-    """
+        Args:
+            recipient: The recipient - either a phone number with country code but no + or other symbols,
+                     or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+            media_path: The absolute path to the media file to send (image, video, document)
 
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {"success": success, "message": status_message}
+        Returns:
+            A dictionary containing success status and a status message
+        """
+        path_error = validate_media_path(media_path)
+        if path_error:
+            return {"success": False, "message": path_error}
 
+        success, status_message = whatsapp_send_file(recipient, media_path)
+        return {"success": success, "message": status_message}
 
-@mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
+    @mcp.tool()
+    def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
+        """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
 
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
+        Args:
+            recipient: The recipient - either a phone number with country code but no + or other symbols,
+                     or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+            media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
 
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {"success": success, "message": status_message}
+        Returns:
+            A dictionary containing success status and a status message
+        """
+        path_error = validate_media_path(media_path)
+        if path_error:
+            return {"success": False, "message": path_error}
+
+        success, status_message = whatsapp_audio_voice_message(recipient, media_path)
+        return {"success": success, "message": status_message}
 
 
 @mcp.tool()
